@@ -1,0 +1,85 @@
+---
+name: kassa
+description: Prepares the next day's KASA-BANKA kassa workbook in this project from the latest existing one, pulling in new bank statements from Выписки\, rolling DEVREDEN KASA forward, fetching the CBU USD rate, and verifying the books reconcile. Trigger this whenever the user types /kassa, asks to prepare/update/yangilash the kassa or KASA-BANKA file, mentions kunlik kassa, bugungi kassa, or asks to process new выписка/bank statement files into the kassa workbook — even if they don't name the skill directly.
+---
+
+# Kassa — daily KASA-BANKA preparation
+
+This skill runs the full daily bookkeeping workflow for the `KASA-BANKA` workbook in this project: `kassa\` holds one workbook per day, `Выписки\` holds the raw bank statement exports. The steps below were worked out and corrected by the account owner across a real live session, so follow them precisely rather than improvising — several of them fix real, previously-discovered bugs, and re-introducing an "obvious" simpler approach will reproduce those bugs.
+
+## 1. Set up the new file
+
+Find the most recent `KASA-BANKA <date>.xlsx` in `kassa\`. Determine today's real system date. Copy the source file to a new file in the same folder named with today's date — **never modify the source file**, only read it.
+
+## 2. How to edit the workbook safely
+
+Never open and re-save this workbook with openpyxl or any similar library — that silently strips the embedded images, drawings, and printer settings baked into the file, which the owner explicitly does not want lost. Instead:
+
+- Treat the `.xlsx` as a zip archive.
+- Read the specific sheet XML you need to change as text, and patch only the exact `<c r="...">...</c>` cell elements that need new values, using targeted string/regex replacement. Leave every other byte of the archive untouched — copy unmodified zip entries through as-is.
+- After all edits, set `fullCalcOnLoad="1"` on `xl/workbook.xml`'s `<calcPr>` element so Excel recalculates every formula the moment the file is opened (you're changing input data, not the cached formula results, so this is what makes the file show correct numbers).
+- Python 3 with openpyxl is installed at `<PATH_TO_PYTHON>` (your full Python path) — call it by that full path (the bare `python` command on this machine resolves to a broken Windows Store stub, not a real install). Use openpyxl freely for *reading* (with `data_only=True` for computed values, `data_only=False` for formulas) to inspect the workbook and verify your work — just never use it to write the file back.
+- After writing, always diff the zip's entry list and the byte-length of every media/drawing/printerSettings entry against the source file to confirm nothing was lost, and check that `sharedStrings.xml`'s declared `uniqueCount` matches the actual number of `<si>` elements (a mismatch means the patch went wrong somewhere).
+
+## 3. Bank account mapping
+
+Match account numbers found in statement files to the correct ledger sheet using this table. If an account number appears that isn't in this list, **stop and ask the owner** which account it is rather than guessing — then add it here for next time.
+
+| Account number | Maps to |
+|---|---|
+| `<ACCOUNT_1>` | Bank A main UZS (`Bank A UZS NEW` sheet) |
+| `<ACCOUNT_2>` | Bank A old UZS (`Bank A UZS` sheet) |
+| `<ACCOUNT_3>` | Bank A USD (`Bank A USD` sheet) |
+| `<ACCOUNT_4>` | Bank A EUR |
+| `<ACCOUNT_5>` | Bank A RUB |
+| `<ACCOUNT_6>` | Second company UZS (`COMPANY B UZS` sheet) |
+| `<ACCOUNT_7>` | Bank B UZS (`Bank B UZS` sheet) |
+| `<ACCOUNT_8>` | Bank B RUB |
+
+> Replace the placeholders with your own account numbers in your private copy. Never commit real account numbers.
+
+`KASA-BANKA` row 9 (`BANK A SUM #1`) is the new Bank A account; row 16 (`BANK A SUM #2`) is the *old* Bank A account — these are two different physical accounts, don't conflate them.
+
+## 4. Process each new statement
+
+Look in `Выписки\` (subfolders per bank, e.g. `Bank A`, `Bank B`) for statement files. If the same statement content appears under two different filenames (a re-upload), treat it as one source, not two.
+
+For every account that has a new statement:
+1. Open it (with openpyxl, read-only) and extract the transaction rows.
+2. In that account's ledger sheet, **clear all of the previous day's transaction rows and replace them with only today's transactions** — these sheets are meant to hold one day's activity, not an accumulating history. Reuse the existing row range and per-column cell styles (they're consistent down every row in these ledgers) so the sheet's `SUM` formula range doesn't need to move. If today's transaction count exceeds the available pre-formatted rows, you'll need to extend the range and shift the `SUM` row down by exactly as many rows as you added — and then also update any formula elsewhere in the workbook that hardcodes a reference to that `SUM` row's old location (search the whole workbook's sheet XML for the sheet name to find every cross-reference before you shift anything).
+3. On the `KASA-BANKA` sheet, overwrite that account's balance cell with the statement's own stated closing balance.
+
+For accounts with **no** new statement today, leave that ledger sheet and its `KASA-BANKA` balance cell completely untouched.
+
+## 5. Roll DEVREDEN KASA forward
+
+`DEVREDEN KASA` (row 52) is plain data, not a formula — the owner's process requires updating it every single day, and the old file having a stale value here (rather than rolling it forward) is a known imperfection of manual bookkeeping, not the intended design. Set its date to today, and set its SUM/USD/EUR/RUB amounts to the **previous** file's `KASA BANKA GENEL TOPLAM` (row 51) values, read exactly as they were computed there.
+
+## 6. Fetch today's USD rate
+
+Fetch `https://cbu.uz/uz/arkhiv-kursov-valyut/json/USD/<date>/` and write the `Rate` value into `J4`. CBU doesn't publish new rates on weekends, so the response's own `Date` field may show an earlier date than requested — that's still the correct rate in effect, use it as-is. Only touch USD unless the owner asks for EUR/RUB too.
+
+## 7. F54 / F55 / F56 represent one day only
+
+This is the single most important — and most subtle — rule in the whole workflow, discovered the hard way: **`F54` (supplier payments), `F55` (government payments), and `F56` (income) must reflect only today's activity, never a stale carry-forward.** The owner's own words: *"agar qaysidir schetda hech qanday transaction bo'lmasa uni formulalarga qo'shish shart emas, chunki u yerda bir kunlik statistika"* — if an account had no transactions today, it has no business being summed into these formulas at all, because they're daily statistics, not a running total (the running total is what `DEVREDEN KASA` already carries forward). Concretely, when you find any of the following in these formulas, they're bugs to fix, not intentional design to preserve:
+
+- A term summing an account that has zero new activity today — remove that term from the formula entirely.
+- A formula pointing at one specific, arbitrary cell/row (rather than a real `SUM`/total) to stand in for "today's total" for some account — this happens because someone's ledger-clearing shifted which transaction happens to sit in that row; replace it with a reference to that account's actual current total cell.
+- A flat hardcoded number added on top of the formula that doesn't correspond to any account — this is residue from a one-time prior correction and shouldn't recur; remove it.
+- A formula referencing the wrong column (e.g. the debit total where the credit total belongs, or vice versa) — fix the column reference.
+
+Set `F55` to a literal `0` when today's data contains no actual government/tax payment, rather than leaving it pointing at unrelated old rows.
+
+These formulas are otherwise ones the owner does **not** want casually rewritten — only touch them when step 8's reconciliation proves something is wrong, and explain exactly what you changed and why.
+
+## 8. Mandatory reconciliation — do this every time, don't skip it
+
+After every edit, `KASA BANKA GENEL TOPLAM` (row 51 — computed bottom-up from today's individual account balances) must equal `GÜN SONU KASA BANKA TOPLAMI` (row 57 — computed top-down as DEVREDEN KASA minus today's payments plus today's income) in every currency column: so'm, USD, EUR, RUB.
+
+Compute both sides **independently in Python** from the raw underlying data — don't trust the `.xlsx` file's cached formula values, since those stay stale on disk until Excel itself opens the file and recalculates (which won't have happened yet when you're checking your own work).
+
+If the two totals don't match, don't guess at a fix. Decompose the gap term by term: trace exactly which account's contribution to `F54`/`F56` is missing, wrong, or stale (per step 7's bug patterns above), show the owner the precise numeric breakdown of what explains the gap, and get their confirmation before changing any formula. It's fine for a small residual to remain if it matches an already-known, already-discussed data discrepancy (e.g. a statement's opening balance not quite matching what was previously recorded) — report it plainly rather than forcing it to zero.
+
+## 9. Report back
+
+Finish with a clear, concise summary: which file was created, which accounts/ledger sheets were updated (with old → new closing balances), the CBU rate used, the DEVREDEN KASA rollover values, the reconciliation result (matched, or the exact residual and why), and anything you had to stop and ask about along the way.
